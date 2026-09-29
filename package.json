@@ -1,0 +1,56 @@
+{
+  "name": "pi-fwd",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Attach browsers to live Pi terminal sessions through a shared local hub.",
+  "type": "module",
+  "bin": {
+    "pi-fwd": "./bin/pi-fwd"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-fwd.ts"
+    ]
+  },
+  "files": [
+    "bin",
+    "dist",
+    "extensions",
+    "hub",
+    "test",
+    "install",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "esbuild ./hub/hub.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=./dist/hub.js",
+    "prepare": "npm run build",
+    "start": "node ./dist/hub.js",
+    "test": "node --experimental-strip-types --test ./test/smoke.test.mjs",
+    "check": "node --experimental-strip-types --check ./hub/hub.ts && node --experimental-strip-types --check ./hub/net.ts && node --experimental-strip-types --check ./extensions/pi-fwd.ts"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "dependencies": {
+    "ansi-to-html": "0.7.2",
+    "marked": "18.0.11",
+    "web-push": "3.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
+    "@earendil-works/pi-tui": ">=0.87.1"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  },
+  "license": "MIT"
+}

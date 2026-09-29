@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Start the pi-fwd hub (default 127.0.0.1:30142; override with PI_FWD_HUB_ADDR).
+set -euo pipefail
+
+script="${BASH_SOURCE[0]}"
+while [[ -L "$script" ]]; do
+  script_dir="$(cd -P -- "$(dirname -- "$script")" && pwd)"
+  target="$(readlink -- "$script")"
+  [[ "$target" = /* ]] && script="$target" || script="$script_dir/$target"
+done
+root="$(cd -- "$(dirname -- "$script")/.." && pwd -P)"
+exec node "$root/dist/hub.js" "$@"

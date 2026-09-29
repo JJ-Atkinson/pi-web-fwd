@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+npm ci --omit=dev --ignore-scripts --prefix "$root"
+pi install "$root"
+
+printf 'Installed pi-fwd from %s\n' "$root"
+printf 'Start the hub with %s/bin/pi-fwd\n' "$root"

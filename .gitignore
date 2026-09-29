@@ -1,0 +1,5 @@
+node_modules/
+pi-fwd-*.tgz
+.state/
+*.log
+.DS_Store
