@@ -27,7 +27,7 @@
     "prepare": "npm run build",
     "start": "node ./dist/hub.js",
     "test": "node --experimental-strip-types --test ./test/*.test.mjs",
-    "check": "node --experimental-strip-types --check ./hub/hub.ts && node --experimental-strip-types --check ./hub/net.ts && node --experimental-strip-types --check ./extensions/pi-fwd.ts && node --experimental-strip-types --check ./extensions/thinking.ts && node --experimental-strip-types --check ./extensions/tool-presentation.ts && node --experimental-strip-types --check ./extensions/file-tool-renderer.ts"
+    "check": "node --experimental-strip-types --check ./hub/hub.ts && node --experimental-strip-types --check ./hub/net.ts && node --experimental-strip-types --check ./extensions/pi-fwd.ts && node --experimental-strip-types --check ./extensions/thinking.ts && node --experimental-strip-types --check ./extensions/tool-presentation.ts && node --experimental-strip-types --check ./extensions/file-tool-renderer.ts && node --experimental-strip-types --check ./extensions/transcript-fallback.ts"
   },
   "engines": {
     "node": ">=22.6"

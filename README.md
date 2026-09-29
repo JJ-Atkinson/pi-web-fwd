@@ -16,6 +16,9 @@ continues to own its model session, editor, tools, and session file.
 - Built-in and custom tools render through Pi's `ToolExecutionComponent`.
 - Read, Write, Edit, and Apply Patch cards use semantic headers with file,
   range, line, replacement, and patch-size summaries. Read starts collapsed.
+- Specialized Pi tool variants keep Pi's terminal renderer when a semantic
+  renderer does not own their presentation. Unrecognized transcript
+  components also fail open to bounded terminal rendering.
 - Tool output cards start collapsed on mobile and retain independent
   disclosure state for each attached browser.
 - Tool calls without a terminal result after an interrupted run are marked

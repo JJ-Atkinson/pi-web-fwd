@@ -8,6 +8,7 @@ import {
   createWriteToolDefinition,
   FooterComponent,
   InteractiveMode,
+  parseSkillBlock,
   ToolExecutionComponent,
   type ExtensionAPI,
   type ExtensionContext,
@@ -46,6 +47,12 @@ import {
   toolWebPresentation,
   transitionToolStatus,
 } from "./tool-presentation.ts";
+import {
+  boundTranscriptLines,
+  hasSpecializedPiToolPresentation,
+  needsTranscriptFallback,
+  transcriptFallbackTitle,
+} from "./transcript-fallback.ts";
 
 const HEARTBEAT_MS = 15_000;
 const EXT_LOG = process.env.PI_FWD_LOG;
@@ -106,6 +113,15 @@ type LiveEditor = {
   getLines?: () => string[];
   getText?: () => string;
 };
+type TranscriptComponent = {
+  render: (width: number) => string[];
+  setExpanded?: (expanded: boolean) => void;
+  constructor?: { name?: string };
+};
+type TranscriptCapture = {
+  message: unknown;
+  components: TranscriptComponent[];
+};
 const live = globalThis as unknown as {
   __piFwdEditor?: LiveEditor;
   __piFwdTui?: {
@@ -117,9 +133,13 @@ const live = globalThis as unknown as {
   __piFwdOnFooter?: (rawLines: string[]) => void;
   __piFwdPainting?: boolean;
   __piFwdToolDefinitions?: Map<string, unknown>;
+  __piFwdOnTranscriptComponents?: (capture: TranscriptCapture) => void;
+  __piFwdOnTranscriptReset?: () => void;
+  __piFwdPendingTranscriptComponents?: TranscriptCapture[];
   __piFwdMode?: {
     editorContainer?: { render: (width: number) => string[] };
     editor?: LiveEditor;
+    chatContainer?: { children?: TranscriptComponent[] };
     getRegisteredToolDefinition?: (toolName: string) => unknown;
     toolOutputExpanded?: boolean;
   };
@@ -176,8 +196,14 @@ live.__piFwdToolDefinitions ??= new Map();
   const proto = InteractiveMode.prototype as unknown as {
     setupEditorSubmitHandler?: () => void;
     getRegisteredToolDefinition?: (toolName: string) => unknown;
+    addMessageToChat?: (message: unknown, options?: unknown) => unknown;
+    renderSessionItems?: (items: unknown, options?: unknown) => unknown;
     __piFwdOrigGetToolDefinition?: (toolName: string) => unknown;
+    __piFwdOrigAddMessageToChat?: (message: unknown, options?: unknown) => unknown;
+    __piFwdOrigRenderSessionItems?: (items: unknown, options?: unknown) => unknown;
     __piFwdSubmitHook?: boolean;
+    __piFwdTranscriptHook?: boolean;
+    chatContainer?: { children?: TranscriptComponent[] };
   };
   if (typeof proto.getRegisteredToolDefinition === "function") {
     proto.__piFwdOrigGetToolDefinition ??= proto.getRegisteredToolDefinition;
@@ -211,6 +237,43 @@ live.__piFwdToolDefinitions ??= new Map();
     };
     proto.__piFwdSubmitHook = true;
   }
+  if (typeof proto.addMessageToChat === "function" && !proto.__piFwdTranscriptHook) {
+    proto.__piFwdOrigAddMessageToChat = proto.addMessageToChat;
+    const addMessage = proto.__piFwdOrigAddMessageToChat;
+    proto.addMessageToChat = function (
+      this: typeof proto,
+      message: unknown,
+      options?: unknown,
+    ) {
+      const children = this.chatContainer?.children;
+      const before = children?.length ?? 0;
+      const result = addMessage.call(this, message, options);
+      const added = (this.chatContainer?.children ?? []).slice(before);
+      if (added.length > 0) {
+        const capture = { message, components: added };
+        const publish = live.__piFwdOnTranscriptComponents;
+        if (publish) queueMicrotask(() => publish(capture));
+        else {
+          live.__piFwdPendingTranscriptComponents ??= [];
+          live.__piFwdPendingTranscriptComponents.push(capture);
+        }
+      }
+      return result;
+    };
+    if (typeof proto.renderSessionItems === "function") {
+      proto.__piFwdOrigRenderSessionItems = proto.renderSessionItems;
+      const renderItems = proto.__piFwdOrigRenderSessionItems;
+      proto.renderSessionItems = function (
+        this: typeof proto,
+        items: unknown,
+        options?: unknown,
+      ) {
+        live.__piFwdOnTranscriptReset?.();
+        return renderItems.call(this, items, options);
+      };
+    }
+    proto.__piFwdTranscriptHook = true;
+  }
 }
 const EDITOR_POLL_MS = 100;
 const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -237,6 +300,7 @@ const clientCols = new WeakMap<Client, number>();
 const clientVisible = new WeakMap<Client, boolean>();
 const clientMobile = new WeakMap<Client, boolean>();
 const clientToolExpanded = new WeakMap<Client, Map<string, boolean>>();
+const clientComponentExpanded = new WeakMap<Client, Map<string, boolean>>();
 
 function hubBase(): string {
   return hubClientUrl(parseHubAddress(process.env.PI_FWD_HUB_ADDR));
@@ -308,6 +372,20 @@ function semanticMessageText(value: unknown): string {
     if (rec.content !== undefined) return semanticMessageText(rec.content);
   }
   return "";
+}
+
+function transcriptMessageKey(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const message = value as Record<string, unknown>;
+  return createHash("sha256")
+    .update(JSON.stringify([
+      message.role ?? "",
+      message.timestamp ?? "",
+      message.customType ?? "",
+      semanticMessageText(message),
+    ]))
+    .digest("hex")
+    .slice(0, 20);
 }
 
 function notificationFirstLine(value: string): string {
@@ -719,7 +797,15 @@ pre, .card-body, #composer, #composer * {
   padding: 2px 8px;
 }
 #log { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
-.card { border: 1px solid var(--border); border-left: 3px solid #666; border-radius: 4px; background: var(--panel); color: var(--text); overflow: hidden; cursor: pointer; }
+.card {
+  border: 1px solid var(--border);
+  border-left: 3px solid #666;
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  overflow: clip;
+  cursor: pointer;
+}
 .card.user { border-left-color: #5a9; }
 .card.assistant { border-left-color: #79c; }
 .card.thinking { border-left-color: #9670b8; }
@@ -728,7 +814,27 @@ pre, .card-body, #composer, #composer * {
 .card.tool-write { border-left-color: #4a8f62; }
 .card.tool-edit { border-left-color: #c88a32; }
 .card.tool-apply_patch { border-left-color: #9167b2; }
-.card-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px; background: var(--panel-head); }
+.card-head {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--panel-head);
+  border-radius: 3px 3px 0 0;
+}
+.app-header:not(.hidden) ~ #log .card-head {
+  top: var(--app-header-height, 42px);
+}
+@keyframes collapsed-card-flash {
+  from { background: #d6b929; }
+  to { background: var(--panel-head); }
+}
+.card.collapse-flash > .card-head {
+  animation: collapsed-card-flash 1s ease-out;
+}
 .card-head, .card-toggle { cursor: pointer; -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none; }
 .card-title { font-weight: bold; color: var(--title); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-state { color: var(--muted); font-size: 0.85em; white-space: nowrap; }
@@ -891,6 +997,7 @@ body { font-family: ui-monospace, monospace; background: var(--page-bg); color: 
 }
 @media (prefers-reduced-motion: reduce) {
   .app-header, #bottom-dock { transition: none; }
+  .card.collapse-flash > .card-head { animation: none; }
 }
 </style>
 <header id="app-header" class="app-header">
@@ -1075,6 +1182,10 @@ document.addEventListener("pointerdown", (ev) => {
 let lastScrollY = window.scrollY;
 function syncDesktopDock() {
   document.documentElement.style.setProperty(
+    "--app-header-height",
+    Math.ceil(appHeader.getBoundingClientRect().height) + "px",
+  );
+  document.documentElement.style.setProperty(
     "--bottom-dock-height",
     Math.ceil(bottomDock.getBoundingClientRect().height + 30) + "px",
   );
@@ -1114,6 +1225,7 @@ desktopDock.addEventListener("change", () => {
   sendSize();
 });
 new ResizeObserver(syncDesktopDock).observe(bottomDock);
+new ResizeObserver(syncDesktopDock).observe(appHeader);
 syncDesktopDock();
 applyTheme();
 const KB_HOLD = "\\u200b";
@@ -1330,7 +1442,10 @@ function syncCardDisclosure(card) {
   toggle.title = expanded ? "Show less" : "Show more";
   toggle.setAttribute("aria-label", toggle.title);
   const body = card.querySelector(".card-body");
-  if (!card.dataset.itemId?.startsWith("tool:")) {
+  if (
+    !card.dataset.itemId?.startsWith("tool:") &&
+    !card.dataset.itemId?.startsWith("component:")
+  ) {
     const displayText = expanded ? (body._fullText || "(no text)") : (preview || "(no text)");
     if (card.classList.contains("assistant") || card.classList.contains("thinking")) {
       body.classList.add("markdown");
@@ -1373,6 +1488,33 @@ function syncCardTiming(card, timing) {
     element.setAttribute("aria-label", "Running");
   }
 }
+function scheduleCollapsedCardPosition(card) {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (card.dataset.expanded !== "false") {
+      delete card.dataset.positionAfterCollapse;
+      return;
+    }
+    const viewportTop = visualViewportApi?.offsetTop || 0;
+    const viewportHeight = visualViewportApi?.height || window.innerHeight;
+    const headerBottom = appHeader.classList.contains("hidden")
+      ? viewportTop
+      : Math.max(viewportTop, appHeader.getBoundingClientRect().bottom);
+    const viewportBottom = viewportTop + viewportHeight;
+    const cardTop = card.getBoundingClientRect().top;
+    if (cardTop < headerBottom || cardTop >= viewportBottom) {
+      const desiredTop = viewportTop + viewportHeight / 6;
+      window.scrollTo({
+        top: Math.max(0, window.scrollY + cardTop - desiredTop),
+        behavior: "auto",
+      });
+    }
+    card.classList.remove("collapse-flash");
+    void card.offsetWidth;
+    card.classList.add("collapse-flash");
+    setTimeout(() => card.classList.remove("collapse-flash"), 1020);
+    delete card.dataset.positionAfterCollapse;
+  }));
+}
 function addCard(title, text, kind, itemId, bodyHtml, expanded, timing) {
   const follow = window.innerHeight + window.scrollY >=
     document.documentElement.scrollHeight - 80;
@@ -1391,6 +1533,12 @@ function addCard(title, text, kind, itemId, bodyHtml, expanded, timing) {
     if (expanded !== undefined) existing.dataset.expanded = String(expanded);
     syncCardDisclosure(existing);
     syncCardTiming(existing, timing);
+    if (
+      expanded === false &&
+      existing.dataset.positionAfterCollapse === "true"
+    ) {
+      scheduleCollapsedCardPosition(existing);
+    }
     if (follow) requestAnimationFrame(() => window.scrollTo(0, document.documentElement.scrollHeight));
     return existing;
   }
@@ -1421,6 +1569,8 @@ function addCard(title, text, kind, itemId, bodyHtml, expanded, timing) {
   const toggleBody = () => {
     const nextExpanded = card.dataset.expanded === "false";
     card.dataset.expanded = String(nextExpanded);
+    if (!nextExpanded) card.dataset.positionAfterCollapse = "true";
+    else delete card.dataset.positionAfterCollapse;
     syncCardDisclosure(card);
     if (itemId && itemId.startsWith("tool:")) {
       if (ws && ws.readyState === 1) {
@@ -1430,6 +1580,23 @@ function addCard(title, text, kind, itemId, bodyHtml, expanded, timing) {
           expanded: nextExpanded,
         }));
       }
+    } else if (itemId && itemId.startsWith("component:")) {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({
+          type: "component-expanded",
+          componentId: itemId.slice("component:".length),
+          expanded: nextExpanded,
+        }));
+      }
+    }
+    if (
+      !nextExpanded &&
+      (!itemId || (
+        !itemId.startsWith("tool:") &&
+        !itemId.startsWith("component:")
+      ))
+    ) {
+      scheduleCollapsedCardPosition(card);
     }
   };
   toggle.addEventListener("click", (ev) => {
@@ -1536,6 +1703,14 @@ function renderFileToolItem(msg) {
       : msg.completedAt
         ? { status: msg.status, completedAt: msg.completedAt }
         : { status: msg.status, running: true, startedAt: msg.startedAt });
+}
+function renderTranscriptComponent(msg) {
+  const itemId = "component:" + String(msg.componentId || "");
+  addCard(msg.title || "Pi transcript", "", "tool fallback", itemId,
+    String(msg.html || ""), msg.expanded === true);
+}
+function resetTranscriptComponents() {
+  for (const card of log.querySelectorAll('[data-item-id^="component:"]')) card.remove();
 }
 function subagentUsageText(usage, model) {
   const compact = (value) => {
@@ -1760,6 +1935,8 @@ function onWsMessage(ev) {
   if (msg.type === "event") renderEvent(msg);
   if (msg.type === "tty-item") renderTtyItem(msg);
   if (msg.type === "file-tool-item") renderFileToolItem(msg);
+  if (msg.type === "transcript-component") renderTranscriptComponent(msg);
+  if (msg.type === "transcript-components-reset") resetTranscriptComponents();
   if (msg.type === "subagent-item") renderSubagentItem(msg);
   if (msg.type === "session-title" && msg.title) {
     sessionTitleButton.textContent = String(msg.title);
@@ -2021,6 +2198,13 @@ export default function piFwd(pi: ExtensionAPI) {
   let fallbackPrompt = "";
   const clients = new Set<Client>();
   const liveToolCallIds = new Set<string>();
+  let transcriptComponentCounter = 0;
+  const transcriptComponentIds = new WeakMap<object, string>();
+  const transcriptComponents = new Map<string, {
+    component: TranscriptComponent;
+    title: string;
+    messageKey: string;
+  }>();
   const toolComponents = new Map<string, {
     component: ToolExecutionComponent;
     toolName: string;
@@ -2053,6 +2237,89 @@ export default function piFwd(pi: ExtensionAPI) {
 
   function emitEvent(kind: string, extra: Record<string, unknown> = {}): void {
     broadcast({ type: "event", event: kind, ...extra });
+  }
+
+  function publishTranscriptComponent(componentId: string, target?: Client): void {
+    const state = transcriptComponents.get(componentId);
+    if (!state) return;
+    const recipients = target ? [target] : [...clients];
+    for (const client of recipients) {
+      let disclosure = clientComponentExpanded.get(client);
+      if (!disclosure) {
+        disclosure = new Map();
+        clientComponentExpanded.set(client, disclosure);
+      }
+      const expanded = disclosure.get(componentId) ?? false;
+      try {
+        state.component.setExpanded?.(expanded);
+        const rendered = state.component.render(clientCols.get(client) ?? 80);
+        const bounded = boundTranscriptLines(rendered);
+        const rawLines = [...bounded.lines];
+        if (bounded.omitted > 0) rawLines.push(`… (${bounded.omitted} more lines)`);
+        while (rawLines.length > 0 && !stripAnsi(rawLines[0]).trim()) rawLines.shift();
+        while (rawLines.length > 0 && !stripAnsi(rawLines[rawLines.length - 1]).trim()) {
+          rawLines.pop();
+        }
+        if (rawLines.length === 0) continue;
+        client.send({
+          type: "transcript-component",
+          componentId,
+          title: state.title,
+          html: ansiLinesHtml(rawLines),
+          expanded,
+        });
+      } catch (error) {
+        extLog(`transcript fallback render failed: ${String(error)}`);
+      }
+    }
+  }
+
+  function captureTranscriptComponents(capture: TranscriptCapture): void {
+    for (const component of capture.components) {
+      const name = component.constructor?.name ?? "";
+      if (!needsTranscriptFallback(name) || typeof component.render !== "function") continue;
+      let componentId = transcriptComponentIds.get(component as object);
+      if (!componentId) {
+        componentId = String(++transcriptComponentCounter);
+        transcriptComponentIds.set(component as object, componentId);
+      }
+      if (!transcriptComponents.has(componentId)) {
+        transcriptComponents.set(componentId, {
+          component,
+          title: transcriptFallbackTitle(name),
+          messageKey: transcriptMessageKey(capture.message),
+        });
+      }
+      publishTranscriptComponent(componentId);
+    }
+  }
+
+  function resetTranscriptComponents(): void {
+    transcriptComponents.clear();
+    broadcast({ type: "transcript-components-reset" });
+  }
+
+  function publishTranscriptComponentsForMessage(message: unknown, client: Client): Set<string> {
+    const key = transcriptMessageKey(message);
+    const published = new Set<string>();
+    if (!key) return published;
+    for (const [componentId, state] of transcriptComponents) {
+      if (state.messageKey !== key) continue;
+      publishTranscriptComponent(componentId, client);
+      published.add(componentId);
+    }
+    return published;
+  }
+
+  live.__piFwdOnTranscriptComponents = captureTranscriptComponents;
+  live.__piFwdOnTranscriptReset = resetTranscriptComponents;
+  for (const capture of live.__piFwdPendingTranscriptComponents ?? []) {
+    captureTranscriptComponents(capture);
+  }
+  live.__piFwdPendingTranscriptComponents = [];
+  const existingTranscript = live.__piFwdMode?.chatContainer?.children ?? [];
+  if (existingTranscript.length > 0) {
+    captureTranscriptComponents({ message: undefined, components: existingTranscript });
   }
 
   function publishThinking(completedAt?: number, target?: Client): void {
@@ -2159,6 +2426,22 @@ export default function piFwd(pi: ExtensionAPI) {
     return state;
   }
 
+  function prefersPiToolRenderer(
+    state: { component: ToolExecutionComponent; toolName: string },
+    cols: number,
+  ): boolean {
+    if (state.toolName !== "read") return false;
+    try {
+      state.component.setExpanded(false);
+      return hasSpecializedPiToolPresentation(
+        state.toolName,
+        state.component.render(cols).map(stripAnsi),
+      );
+    } catch {
+      return true;
+    }
+  }
+
   function publishTool(toolCallId: string, target?: Client): void {
     const state = toolComponents.get(toolCallId);
     if (!state) return;
@@ -2184,13 +2467,21 @@ export default function piFwd(pi: ExtensionAPI) {
         });
         continue;
       }
-      const fileBody = fileToolBody(
-        state.toolName,
-        state.args,
-        state.result,
-        state.isError,
-        expanded,
-      );
+      const cols = clientCols.get(client) ?? 80;
+      let fileBody: FileToolBody | undefined;
+      if (!prefersPiToolRenderer(state, cols)) {
+        try {
+          fileBody = fileToolBody(
+            state.toolName,
+            state.args,
+            state.result,
+            state.isError,
+            expanded,
+          );
+        } catch (error) {
+          extLog(`semantic tool renderer failed open for ${state.toolName}: ${String(error)}`);
+        }
+      }
       if (fileBody) {
         client.send({
           type: "file-tool-item",
@@ -2206,7 +2497,6 @@ export default function piFwd(pi: ExtensionAPI) {
         });
         continue;
       }
-      const cols = clientCols.get(client) ?? 80;
       state.component.setExpanded(expanded);
       const rawLines = state.component.render(cols);
       while (rawLines.length > 0 && !stripAnsi(rawLines[0]).trim()) rawLines.shift();
@@ -2391,6 +2681,9 @@ export default function piFwd(pi: ExtensionAPI) {
       if (typeof msg.mobile === "boolean") clientMobile.set(client, msg.mobile);
       publishComposer(client);
       for (const toolCallId of toolComponents.keys()) publishTool(toolCallId, client);
+      for (const componentId of transcriptComponents.keys()) {
+        publishTranscriptComponent(componentId, client);
+      }
       return;
     }
     if (
@@ -2407,6 +2700,22 @@ export default function piFwd(pi: ExtensionAPI) {
         }
         disclosure.set(msg.toolCallId, msg.expanded);
         publishTool(msg.toolCallId, client);
+      }
+      return;
+    }
+    if (
+      msg.type === "component-expanded" &&
+      typeof msg.componentId === "string" &&
+      typeof msg.expanded === "boolean"
+    ) {
+      if (transcriptComponents.has(msg.componentId)) {
+        let disclosure = clientComponentExpanded.get(client);
+        if (!disclosure) {
+          disclosure = new Map();
+          clientComponentExpanded.set(client, disclosure);
+        }
+        disclosure.set(msg.componentId, msg.expanded);
+        publishTranscriptComponent(msg.componentId, client);
       }
       return;
     }
@@ -2444,6 +2753,7 @@ export default function piFwd(pi: ExtensionAPI) {
   }
 
   function hydrateClient(client: Client): void {
+    const publishedFallbacks = new Set<string>();
     try {
       const messages = uiCtx?.sessionManager.buildSessionProjection()?.messages ?? [];
       const resultIds = new Set(
@@ -2489,6 +2799,8 @@ export default function piFwd(pi: ExtensionAPI) {
       for (const message of messages) {
         const role = (message as { role?: string }).role;
         if (!role || role === "system") continue;
+        const messageFallbacks = publishTranscriptComponentsForMessage(message, client);
+        for (const componentId of messageFallbacks) publishedFallbacks.add(componentId);
         if (role === "toolResult") {
           const result = message as {
             toolCallId?: string;
@@ -2535,14 +2847,21 @@ export default function piFwd(pi: ExtensionAPI) {
             });
           }
         }
-        client.send({
-          type: "event",
-          event: "history",
-          role,
-          id: historyId,
-          text: semanticMessageText(message),
-          timestamp: (message as { timestamp?: unknown }).timestamp,
-        });
+        let historyText = semanticMessageText(message);
+        if (role === "user") {
+          const skill = parseSkillBlock(historyText);
+          if (skill) historyText = skill.userMessage;
+        }
+        if (historyText || messageFallbacks.size === 0) {
+          client.send({
+            type: "event",
+            event: "history",
+            role,
+            id: historyId,
+            text: historyText,
+            timestamp: (message as { timestamp?: unknown }).timestamp,
+          });
+        }
         if (role === "assistant") {
           const content = (message as { content?: unknown }).content;
           if (Array.isArray(content)) {
@@ -2571,6 +2890,9 @@ export default function piFwd(pi: ExtensionAPI) {
       });
     }
     publishThinking(undefined, client);
+    for (const componentId of transcriptComponents.keys()) {
+      if (!publishedFallbacks.has(componentId)) publishTranscriptComponent(componentId, client);
+    }
     publishSessionTitle(client);
     publishComposer(client);
   }
@@ -2637,6 +2959,13 @@ export default function piFwd(pi: ExtensionAPI) {
     assistantStreamText = "";
     assistantStreamStartedAt = undefined;
     assistantThinking.clear();
+    if (live.__piFwdOnTranscriptComponents === captureTranscriptComponents) {
+      live.__piFwdOnTranscriptComponents = undefined;
+    }
+    if (live.__piFwdOnTranscriptReset === resetTranscriptComponents) {
+      live.__piFwdOnTranscriptReset = undefined;
+    }
+    transcriptComponents.clear();
     fallbackPrompt = "";
     listenPort = undefined;
     for (const client of [...clients]) {
@@ -2731,7 +3060,11 @@ export default function piFwd(pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     const role = (event.message as { role?: string } | undefined)?.role;
     const streamId = role === "assistant" ? assistantStreamId : undefined;
-    const text = semanticMessageText(event.message);
+    let text = semanticMessageText(event.message);
+    if (role === "user") {
+      const skill = parseSkillBlock(text);
+      if (skill) text = skill.userMessage;
+    }
     if (role === "assistant") {
       assistantThinking.replaceFromMessage(event.message);
       publishThinking(Date.now());
