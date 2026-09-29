@@ -11,8 +11,15 @@ continues to own its model session, editor, tools, and session file.
 - Each Pi process serves its own session UI revision behind the shared hub.
 - Browser input travels through Pi's real terminal editor and focused TUI
   component, including slash commands, selectors, paste, and multiline input.
-- Assistant Markdown and tool results stream into stable transcript cards.
+- Assistant Markdown and aggregated thinking stream into separate stable
+  transcript cards.
 - Built-in and custom tools render through Pi's `ToolExecutionComponent`.
+- Read, Write, Edit, and Apply Patch cards use semantic headers with file,
+  range, line, replacement, and patch-size summaries. Read starts collapsed.
+- Tool output cards start collapsed on mobile and retain independent
+  disclosure state for each attached browser.
+- Tool calls without a terminal result after an interrupted run are marked
+  **Interrupted** in the card header instead of retaining a running spinner.
 - The `@mjakl/pi-subagent` tool receives a structured browser renderer when
   that independent extension is installed.
 - Pi session names are editable inline. Unnamed sessions use the first line of
@@ -171,16 +178,17 @@ session tab reports itself visible.
 
 ## Test
 
-The smoke suite intentionally answers only “does the basic forwarder work?”:
+The test suite includes focused presentation-state checks and a minimal hub
+smoke test:
 
 ```sh
 npm test
 ```
 
-It checks address parsing, deterministic agent-port selection, hub startup,
-request-size enforcement, registration, listing, HTTP proxying, and deletion.
-It is not a security, browser, mobile, push-delivery, or compatibility
-qualification suite.
+It checks thinking aggregation, tool card defaults, address parsing,
+deterministic agent-port selection, hub startup, request-size enforcement,
+registration, listing, HTTP proxying, and deletion. It is not a security,
+browser, mobile, push-delivery, or compatibility qualification suite.
 
 Run syntax checks separately:
 

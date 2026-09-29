@@ -32,6 +32,20 @@ import {
   parseAgentSeriesStart,
   parseHubAddress,
 } from "../hub/net.ts";
+import {
+  ThinkingAccumulator,
+  thinkingBlocksFromMessage,
+} from "./thinking.ts";
+import {
+  fileToolBody,
+  type FileToolBody,
+} from "./file-tool-renderer.ts";
+import {
+  defaultToolExpanded,
+  type ToolRunStatus,
+  toolWebPresentation,
+  transitionToolStatus,
+} from "./tool-presentation.ts";
 
 const HEARTBEAT_MS = 15_000;
 const EXT_LOG = process.env.PI_FWD_LOG;
@@ -221,6 +235,8 @@ type Client = {
 };
 const clientCols = new WeakMap<Client, number>();
 const clientVisible = new WeakMap<Client, boolean>();
+const clientMobile = new WeakMap<Client, boolean>();
+const clientToolExpanded = new WeakMap<Client, Map<string, boolean>>();
 
 function hubBase(): string {
   return hubClientUrl(parseHubAddress(process.env.PI_FWD_HUB_ADDR));
@@ -530,6 +546,7 @@ try {
   --tool-text: #bbb;
   --user: #8c8;
   --assistant: #9bd;
+  --thinking: #c9a7e8;
   --accent: #4a8;
   --header-bg: #eee;
   --header-text: #181818;
@@ -550,6 +567,7 @@ try {
   --tool-text: #444;
   --user: #176b42;
   --assistant: #315f91;
+  --thinking: #704898;
   --accent: #287758;
   --header-bg: #181818;
   --header-text: #eee;
@@ -704,10 +722,17 @@ pre, .card-body, #composer, #composer * {
 .card { border: 1px solid var(--border); border-left: 3px solid #666; border-radius: 4px; background: var(--panel); color: var(--text); overflow: hidden; cursor: pointer; }
 .card.user { border-left-color: #5a9; }
 .card.assistant { border-left-color: #79c; }
+.card.thinking { border-left-color: #9670b8; }
 .card.tool, .card.status { border-left-color: #b86; color: var(--tool-text); }
+.card.tool-read { border-left-color: #4f9da6; }
+.card.tool-write { border-left-color: #4a8f62; }
+.card.tool-edit { border-left-color: #c88a32; }
+.card.tool-apply_patch { border-left-color: #9167b2; }
 .card-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px; background: var(--panel-head); }
 .card-head, .card-toggle { cursor: pointer; -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none; }
 .card-title { font-weight: bold; color: var(--title); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-state { color: var(--muted); font-size: 0.85em; white-space: nowrap; }
+.card-state.interrupted { color: #d98b5f; font-weight: bold; }
 .card-time { margin-left: auto; color: var(--muted); font-size: 0.85em; white-space: nowrap; }
 .card-time.running {
   width: 12px;
@@ -720,7 +745,60 @@ pre, .card-body, #composer, #composer * {
 @keyframes card-spin { to { transform: rotate(360deg); } }
 .card.user .card-title { color: var(--user); }
 .card.assistant .card-title { color: var(--assistant); }
+.card.thinking .card-title { color: var(--thinking); }
+.card.tool-read .card-title { color: #68b8c2; }
+.card.tool-write .card-title { color: #63b97d; }
+.card.tool-edit .card-title { color: #dda04a; }
+.card.tool-apply_patch .card-title { color: #b58ad4; }
 .card-body { margin: 0; padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.file-tool-body {
+  margin: -8px;
+  font-family: SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.82em;
+  font-weight: 400;
+  font-synthesis: none;
+  line-height: 1.32;
+  tab-size: 2;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  overflow: auto;
+}
+.file-tool-row {
+  display: grid;
+  grid-template-columns: 1.6em minmax(2.6em, auto) minmax(0, 1fr);
+  min-width: max-content;
+  padding: 0 8px;
+  white-space: pre;
+}
+.file-tool-row, .file-tool-row > span {
+  font-family: inherit;
+  font-size: inherit;
+  font-style: normal;
+  font-weight: 400;
+  line-height: inherit;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+}
+.file-tool-marker, .file-tool-line {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  user-select: none;
+}
+.file-tool-marker { padding-right: 0.45em; }
+.file-tool-line { padding-right: 0.8em; }
+.file-tool-row.add { background: color-mix(in srgb, #218739 18%, transparent); }
+.file-tool-row.remove { background: color-mix(in srgb, #b83232 18%, transparent); }
+.file-tool-row.add .file-tool-marker { color: #65c77a; }
+.file-tool-row.remove .file-tool-marker { color: #e07878; }
+.file-tool-row.meta {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  color: var(--title);
+  background: var(--panel-soft);
+}
+.file-tool-row.error { color: #e07878; }
+.file-tool-more { padding: 5px 8px; color: var(--muted); background: var(--panel-soft); }
 .markdown { white-space: normal; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
@@ -1033,6 +1111,7 @@ window.addEventListener("scroll", () => {
 desktopDock.addEventListener("change", () => {
   syncDesktopDock();
   syncKeyboardInset();
+  sendSize();
 });
 new ResizeObserver(syncDesktopDock).observe(bottomDock);
 syncDesktopDock();
@@ -1253,7 +1332,7 @@ function syncCardDisclosure(card) {
   const body = card.querySelector(".card-body");
   if (!card.dataset.itemId?.startsWith("tool:")) {
     const displayText = expanded ? (body._fullText || "(no text)") : (preview || "(no text)");
-    if (card.classList.contains("assistant")) {
+    if (card.classList.contains("assistant") || card.classList.contains("thinking")) {
       body.classList.add("markdown");
       body.innerHTML = renderMarkdown(displayText);
     } else {
@@ -1264,9 +1343,20 @@ function syncCardDisclosure(card) {
 }
 function syncCardTiming(card, timing) {
   if (!timing) return;
+  const state = card.querySelector(".card-state");
+  if (state && timing.status !== undefined) {
+    state.textContent = timing.status === "interrupted" ? "Interrupted" : "";
+    state.className = "card-state" +
+      (timing.status === "interrupted" ? " interrupted" : "");
+  }
   const element = card.querySelector(".card-time");
   if (!element) return;
-  if (timing.completedAt) {
+  if (timing.status === "interrupted" && !timing.completedAt) {
+    element.classList.remove("running");
+    element.textContent = "";
+    element.title = "Interrupted";
+    element.setAttribute("aria-label", "Interrupted");
+  } else if (timing.completedAt) {
     element.classList.remove("running");
     const completed = new Date(
       typeof timing.completedAt === "number" ? timing.completedAt : String(timing.completedAt),
@@ -1320,6 +1410,8 @@ function addCard(title, text, kind, itemId, bodyHtml, expanded, timing) {
   toggle.type = "button";
   const time = document.createElement("span");
   time.className = "card-time";
+  const state = document.createElement("span");
+  state.className = "card-state";
   const body = document.createElement("div");
   body.className = "card-body";
   if (bodyHtml !== undefined) body.innerHTML = bodyHtml;
@@ -1351,7 +1443,7 @@ function addCard(title, text, kind, itemId, bodyHtml, expanded, timing) {
     if (selection && !selection.isCollapsed) return;
     toggleBody();
   });
-  head.append(label, time, toggle);
+  head.append(label, state, time, toggle);
   card.append(head, body);
   syncCardDisclosure(card);
   syncCardTiming(card, timing);
@@ -1380,6 +1472,18 @@ function renderEvent(msg) {
     });
     return;
   }
+  if (event === "thinking_update" && msg.id) {
+    const itemId = "thinking:" + String(msg.id);
+    const existing = log.querySelector('[data-item-id="' + CSS.escape(itemId) + '"]');
+    const completed = msg.completedAt !== undefined;
+    const expanded = completed ? false : existing ? undefined : true;
+    if (text) addCard("Thinking", text, "thinking", itemId, undefined, expanded, {
+      running: !completed,
+      startedAt: msg.startedAt,
+      completedAt: msg.completedAt,
+    });
+    return;
+  }
   if ((event === "history" || event === "message_end")
       && (role === "user" || role === "assistant")) {
     if (!text.trim()) return;
@@ -1402,9 +1506,36 @@ function renderEvent(msg) {
     event.startsWith("tool_") ? "tool" : "status");
 }
 function renderTtyItem(msg) {
+  const itemId = String(msg.id || "");
+  const existing = itemId
+    ? log.querySelector('[data-item-id="' + CSS.escape(itemId) + '"]')
+    : null;
+  const expanded = !existing && !desktopDock.matches ? false : msg.expanded !== false;
+  const fileToolKinds = new Set(["read", "write", "edit", "apply_patch"]);
+  const toolKind = fileToolKinds.has(String(msg.toolKind)) ? String(msg.toolKind) : "";
   addCard(msg.title || "terminal output", (msg.lines || []).map(String).join("\\n"),
-    "tool", String(msg.id || ""), msg.html, msg.expanded !== false,
-    msg.completedAt ? { completedAt: msg.completedAt } : { running: true, startedAt: msg.startedAt });
+    "tool" + (toolKind ? " tool-" + toolKind : ""), itemId, msg.html, expanded,
+    msg.status === "interrupted"
+      ? { status: "interrupted", completedAt: msg.completedAt }
+      : msg.completedAt
+        ? { status: msg.status, completedAt: msg.completedAt }
+        : { status: msg.status, running: true, startedAt: msg.startedAt });
+}
+function renderFileToolItem(msg) {
+  const itemId = String(msg.id || "");
+  const existing = itemId
+    ? log.querySelector('[data-item-id="' + CSS.escape(itemId) + '"]')
+    : null;
+  const expanded = !existing && !desktopDock.matches ? false : msg.expanded !== false;
+  const fileToolKinds = new Set(["read", "write", "edit", "apply_patch"]);
+  const toolKind = fileToolKinds.has(String(msg.toolKind)) ? String(msg.toolKind) : "";
+  addCard(msg.title || "file tool", "",
+    "tool" + (toolKind ? " tool-" + toolKind : ""), itemId, String(msg.html || ""), expanded,
+    msg.status === "interrupted"
+      ? { status: "interrupted", completedAt: msg.completedAt }
+      : msg.completedAt
+        ? { status: msg.status, completedAt: msg.completedAt }
+        : { status: msg.status, running: true, startedAt: msg.startedAt });
 }
 function subagentUsageText(usage, model) {
   const compact = (value) => {
@@ -1439,7 +1570,11 @@ function refreshRelativeTimes() {
 }
 setInterval(refreshRelativeTimes, 1000);
 function renderSubagentItem(msg) {
-  const expanded = msg.expanded !== false;
+  const itemId = String(msg.id || "");
+  const existing = itemId
+    ? log.querySelector('[data-item-id="' + CSS.escape(itemId) + '"]')
+    : null;
+  const expanded = !existing && !desktopDock.matches ? false : msg.expanded !== false;
   const list = document.createElement("div");
   list.className = "subagent-list";
   for (const [runIndex, raw] of (Array.isArray(msg.calls) ? msg.calls : []).entries()) {
@@ -1557,8 +1692,12 @@ function renderSubagentItem(msg) {
   }
   refreshRelativeTimes();
   addCard("Subagents", String(msg.status || "delegating"), "tool subagent-card",
-    String(msg.id || ""), list.outerHTML, expanded,
-    msg.completedAt ? { completedAt: msg.completedAt } : { running: true, startedAt: msg.startedAt });
+    itemId, list.outerHTML, expanded,
+    msg.toolStatus === "interrupted"
+      ? { status: "interrupted", completedAt: msg.completedAt }
+      : msg.completedAt
+        ? { status: msg.toolStatus, completedAt: msg.completedAt }
+        : { status: msg.toolStatus, running: true, startedAt: msg.startedAt });
 }
 let footerLines = [];
 function colsOf(el) {
@@ -1576,11 +1715,14 @@ function colsOf(el) {
 }
 function footerCols() { return colsOf(footer); }
 let lastSentCols = 0;
+let lastSentMobile;
 function sendSize() {
   const cols = colsOf(wrap);
-  if (!ws || cols === lastSentCols || ws.readyState !== 1) return;
+  const mobile = !desktopDock.matches;
+  if (!ws || (cols === lastSentCols && mobile === lastSentMobile) || ws.readyState !== 1) return;
   lastSentCols = cols;
-  ws.send(JSON.stringify({ type: "size", cols: cols }));
+  lastSentMobile = mobile;
+  ws.send(JSON.stringify({ type: "size", cols: cols, mobile: mobile }));
 }
 function reflowFooterLine(line, cols) {
   const m = String(line).match(/^(.*?)(\\s{4,})(\\S.*)$/);
@@ -1617,6 +1759,7 @@ function onWsMessage(ev) {
   }
   if (msg.type === "event") renderEvent(msg);
   if (msg.type === "tty-item") renderTtyItem(msg);
+  if (msg.type === "file-tool-item") renderFileToolItem(msg);
   if (msg.type === "subagent-item") renderSubagentItem(msg);
   if (msg.type === "session-title" && msg.title) {
     sessionTitleButton.textContent = String(msg.title);
@@ -1873,14 +2016,16 @@ export default function piFwd(pi: ExtensionAPI) {
   let assistantStreamId: string | undefined;
   let assistantStreamText = "";
   let assistantStreamStartedAt: number | undefined;
+  const assistantThinking = new ThinkingAccumulator();
   let lastOutputFirstLine = "";
   let fallbackPrompt = "";
   const clients = new Set<Client>();
+  const liveToolCallIds = new Set<string>();
   const toolComponents = new Map<string, {
     component: ToolExecutionComponent;
     toolName: string;
     isError: boolean;
-    expanded: boolean;
+    status: ToolRunStatus;
     args: unknown;
     result?: unknown;
     startedAt: number;
@@ -1910,6 +2055,22 @@ export default function piFwd(pi: ExtensionAPI) {
     broadcast({ type: "event", event: kind, ...extra });
   }
 
+  function publishThinking(completedAt?: number, target?: Client): void {
+    if (!assistantStreamId) return;
+    const text = assistantThinking.text();
+    if (!text) return;
+    const message = {
+      type: "event",
+      event: "thinking_update",
+      id: assistantStreamId,
+      text,
+      startedAt: assistantStreamStartedAt,
+      completedAt,
+    };
+    if (target) target.send(message);
+    else broadcast(message);
+  }
+
   function fallbackSessionTitle(): string {
     const line = fallbackPrompt.split(/\r?\n/).find((value) => value.trim())?.trim() ?? "";
     return (line || fallbackPrompt.trim() || "New session").slice(0, 80);
@@ -1931,6 +2092,21 @@ export default function piFwd(pi: ExtensionAPI) {
     else broadcast(message);
   }
 
+  function fileToolBodyHtml(body: FileToolBody): string {
+    const rows = body.rows.map((row) => {
+      const kind = escapeHtml(row.kind);
+      return `<div class="file-tool-row ${kind}">` +
+        `<span class="file-tool-marker">${escapeHtml(row.marker ?? "")}</span>` +
+        `<span class="file-tool-line">${escapeHtml(row.line ?? "")}</span>` +
+        `<span class="file-tool-text">${escapeHtml(row.text)}</span>` +
+        "</div>";
+    }).join("");
+    const more = body.hiddenRows > 0
+      ? `<div class="file-tool-more">${body.hiddenRows} more lines · expand to show more</div>`
+      : "";
+    return `<div class="file-tool-body">${rows}${more}</div>`;
+  }
+
   function ensureToolComponent(
     toolCallId: string,
     toolName: string,
@@ -1939,7 +2115,7 @@ export default function piFwd(pi: ExtensionAPI) {
     component: ToolExecutionComponent;
     toolName: string;
     isError: boolean;
-    expanded: boolean;
+    status: ToolRunStatus;
     args: unknown;
     result?: unknown;
     startedAt: number;
@@ -1972,15 +2148,13 @@ export default function piFwd(pi: ExtensionAPI) {
       ),
       toolName,
       isError: false,
-      expanded: true,
+      status: "running" as const,
       args,
       startedAt: Date.now(),
     };
     state.component.markExecutionStarted();
     state.component.setArgsComplete();
-    // Browser cards own their disclosure state. Start with the complete Pi
-    // rendering; collapsing the card switches this component back to preview.
-    state.component.setExpanded(true);
+    state.component.setExpanded(toolWebPresentation(toolName, args).expanded);
     toolComponents.set(toolCallId, state);
     return state;
   }
@@ -1990,18 +2164,50 @@ export default function piFwd(pi: ExtensionAPI) {
     if (!state) return;
     const recipients = target ? [target] : [...clients];
     for (const client of recipients) {
+      let disclosure = clientToolExpanded.get(client);
+      if (!disclosure) {
+        disclosure = new Map();
+        clientToolExpanded.set(client, disclosure);
+      }
+      const presentation = toolWebPresentation(state.toolName, state.args);
+      const expanded = disclosure.get(toolCallId) ??
+        defaultToolExpanded(state.toolName, state.args, clientMobile.get(client) === true);
       if (state.toolName === "subagent") {
         client.send({
           type: "subagent-item",
           id: `tool:${toolCallId}`,
-          expanded: state.expanded,
+          expanded,
+          toolStatus: state.status,
           startedAt: state.startedAt,
           completedAt: state.completedAt,
           ...subagentWebData(state.args, state.result, state.isError, state.startedAt),
         });
         continue;
       }
+      const fileBody = fileToolBody(
+        state.toolName,
+        state.args,
+        state.result,
+        state.isError,
+        expanded,
+      );
+      if (fileBody) {
+        client.send({
+          type: "file-tool-item",
+          id: `tool:${toolCallId}`,
+          title: presentation.title,
+          toolKind: state.toolName,
+          html: fileToolBodyHtml(fileBody),
+          isError: state.isError,
+          status: state.status,
+          expanded,
+          startedAt: state.startedAt,
+          completedAt: state.completedAt,
+        });
+        continue;
+      }
       const cols = clientCols.get(client) ?? 80;
+      state.component.setExpanded(expanded);
       const rawLines = state.component.render(cols);
       while (rawLines.length > 0 && !stripAnsi(rawLines[0]).trim()) rawLines.shift();
       while (rawLines.length > 0 && !stripAnsi(rawLines[rawLines.length - 1]).trim()) rawLines.pop();
@@ -2009,14 +2215,27 @@ export default function piFwd(pi: ExtensionAPI) {
       client.send({
         type: "tty-item",
         id: `tool:${toolCallId}`,
-        title: state.toolName,
+        title: presentation.title,
+        toolKind: state.toolName,
         lines,
         html: ansiLinesHtml(rawLines),
         isError: state.isError,
-        expanded: state.expanded,
+        status: state.status,
+        expanded,
         startedAt: state.startedAt,
         completedAt: state.completedAt,
       });
+    }
+  }
+
+  function interruptRunningTools(target?: Client, completedAt?: number): void {
+    for (const [toolCallId, state] of toolComponents) {
+      const status = transitionToolStatus(state.status, "interrupt");
+      if (status === state.status) continue;
+      state.status = status;
+      state.completedAt = completedAt;
+      liveToolCallIds.delete(toolCallId);
+      publishTool(toolCallId, target);
     }
   }
 
@@ -2169,6 +2388,7 @@ export default function piFwd(pi: ExtensionAPI) {
     }
     if (msg.type === "size" && typeof msg.cols === "number" && Number.isFinite(msg.cols)) {
       clientCols.set(client, Math.max(20, Math.min(240, Math.floor(msg.cols))));
+      if (typeof msg.mobile === "boolean") clientMobile.set(client, msg.mobile);
       publishComposer(client);
       for (const toolCallId of toolComponents.keys()) publishTool(toolCallId, client);
       return;
@@ -2180,9 +2400,13 @@ export default function piFwd(pi: ExtensionAPI) {
     ) {
       const state = toolComponents.get(msg.toolCallId);
       if (state) {
-        state.expanded = msg.expanded;
-        state.component.setExpanded(msg.expanded);
-        publishTool(msg.toolCallId);
+        let disclosure = clientToolExpanded.get(client);
+        if (!disclosure) {
+          disclosure = new Map();
+          clientToolExpanded.set(client, disclosure);
+        }
+        disclosure.set(msg.toolCallId, msg.expanded);
+        publishTool(msg.toolCallId, client);
       }
       return;
     }
@@ -2222,6 +2446,13 @@ export default function piFwd(pi: ExtensionAPI) {
   function hydrateClient(client: Client): void {
     try {
       const messages = uiCtx?.sessionManager.buildSessionProjection()?.messages ?? [];
+      const resultIds = new Set(
+        messages
+          .filter((message) => (message as { role?: string }).role === "toolResult")
+          .map((message) => (message as { toolCallId?: unknown }).toolCallId)
+          .filter((toolCallId): toolCallId is string => typeof toolCallId === "string"),
+      );
+      const canIdentifyLiveTools = uiCtx?.isIdle() === true || liveToolCallIds.size > 0;
       if (!fallbackPrompt) {
         const firstUser = messages.find((message) => (message as { role?: string }).role === "user");
         if (firstUser) fallbackPrompt = semanticMessageText(firstUser);
@@ -2244,9 +2475,17 @@ export default function piFwd(pi: ExtensionAPI) {
             else if (typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp))) {
               state.startedAt = Date.parse(timestamp);
             }
+            if (
+              canIdentifyLiveTools &&
+              !resultIds.has(rec.id) &&
+              !liveToolCallIds.has(rec.id)
+            ) {
+              state.status = transitionToolStatus(state.status, "interrupt");
+            }
           }
         }
       }
+      let historyAssistantIndex = 0;
       for (const message of messages) {
         const role = (message as { role?: string }).role;
         if (!role || role === "system") continue;
@@ -2261,6 +2500,7 @@ export default function piFwd(pi: ExtensionAPI) {
           if (result.toolCallId && result.toolName) {
             const state = ensureToolComponent(result.toolCallId, result.toolName, {});
             state.isError = result.isError === true;
+            state.status = transitionToolStatus(state.status, "complete");
             const timestamp = (message as { timestamp?: unknown }).timestamp;
             if (typeof timestamp === "number") state.completedAt = timestamp;
             else if (typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp))) {
@@ -2277,13 +2517,44 @@ export default function piFwd(pi: ExtensionAPI) {
           }
           continue;
         }
+        const historyId = role === "assistant"
+          ? `history-${++historyAssistantIndex}`
+          : undefined;
+        if (role === "assistant") {
+          const thinking = thinkingBlocksFromMessage(message)
+            .map((block) => block.text)
+            .join("\n\n");
+          if (thinking) {
+            client.send({
+              type: "event",
+              event: "thinking_update",
+              id: historyId,
+              text: thinking,
+              startedAt: (message as { timestamp?: unknown }).timestamp,
+              completedAt: (message as { timestamp?: unknown }).timestamp,
+            });
+          }
+        }
         client.send({
           type: "event",
           event: "history",
           role,
+          id: historyId,
           text: semanticMessageText(message),
           timestamp: (message as { timestamp?: unknown }).timestamp,
         });
+        if (role === "assistant") {
+          const content = (message as { content?: unknown }).content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (!block || typeof block !== "object") continue;
+              const rec = block as Record<string, unknown>;
+              if (rec.type === "toolCall" && typeof rec.id === "string") {
+                publishTool(rec.id, client);
+              }
+            }
+          }
+        }
       }
     } catch {
       // session manager not ready
@@ -2299,6 +2570,7 @@ export default function piFwd(pi: ExtensionAPI) {
         startedAt: assistantStreamStartedAt,
       });
     }
+    publishThinking(undefined, client);
     publishSessionTitle(client);
     publishComposer(client);
   }
@@ -2364,6 +2636,7 @@ export default function piFwd(pi: ExtensionAPI) {
     assistantStreamId = undefined;
     assistantStreamText = "";
     assistantStreamStartedAt = undefined;
+    assistantThinking.clear();
     fallbackPrompt = "";
     listenPort = undefined;
     for (const client of [...clients]) {
@@ -2411,6 +2684,7 @@ export default function piFwd(pi: ExtensionAPI) {
       assistantStreamId = `${Date.now()}-${++assistantStreamCounter}`;
       assistantStreamText = semanticMessageText(event.message);
       assistantStreamStartedAt = startedAt;
+      assistantThinking.replaceFromMessage(event.message);
     }
     emitEvent("message_start", {
       role,
@@ -2425,7 +2699,15 @@ export default function piFwd(pi: ExtensionAPI) {
       assistantStreamText = "";
     }
     const update = event.assistantMessageEvent;
-    if (update.type === "text_delta") {
+    if (update.type === "thinking_start") {
+      assistantThinking.set(update.contentIndex, "");
+    } else if (update.type === "thinking_delta") {
+      assistantThinking.append(update.contentIndex, update.delta);
+      publishThinking();
+    } else if (update.type === "thinking_end") {
+      assistantThinking.set(update.contentIndex, update.content);
+      publishThinking();
+    } else if (update.type === "text_delta") {
       assistantStreamText += update.delta;
       emitEvent("message_update", {
         role: "assistant",
@@ -2451,6 +2733,8 @@ export default function piFwd(pi: ExtensionAPI) {
     const streamId = role === "assistant" ? assistantStreamId : undefined;
     const text = semanticMessageText(event.message);
     if (role === "assistant") {
+      assistantThinking.replaceFromMessage(event.message);
+      publishThinking(Date.now());
       const firstLine = notificationFirstLine(text);
       if (firstLine) lastOutputFirstLine = firstLine;
     }
@@ -2464,9 +2748,11 @@ export default function piFwd(pi: ExtensionAPI) {
       assistantStreamId = undefined;
       assistantStreamText = "";
       assistantStreamStartedAt = undefined;
+      assistantThinking.clear();
     }
   });
   pi.on("tool_execution_start", (event) => {
+    liveToolCallIds.add(event.toolCallId);
     ensureToolComponent(event.toolCallId, event.toolName, event.args);
     publishTool(event.toolCallId);
   });
@@ -2483,8 +2769,10 @@ export default function piFwd(pi: ExtensionAPI) {
     publishTool(event.toolCallId);
   });
   pi.on("tool_execution_end", (event) => {
+    liveToolCallIds.delete(event.toolCallId);
     const state = ensureToolComponent(event.toolCallId, event.toolName, {});
     state.isError = event.isError;
+    state.status = transitionToolStatus(state.status, "complete");
     const result = event.result && typeof event.result === "object"
       ? { ...event.result, isError: event.isError }
       : { content: [{ type: "text", text: String(event.result ?? "") }], isError: event.isError };
@@ -2495,7 +2783,11 @@ export default function piFwd(pi: ExtensionAPI) {
     if (resultText.trim()) lastOutputFirstLine = notificationFirstLine(resultText);
     publishTool(event.toolCallId);
   });
+  pi.on("agent_before_settle", (event) => {
+    if (event.outcome !== "completed") interruptRunningTools(undefined, Date.now());
+  });
   pi.on("agent_settled", () => {
+    interruptRunningTools(undefined, Date.now());
     emitEvent("agent_settled");
     void notifyPush();
   });

@@ -26,8 +26,8 @@
     "build": "esbuild ./hub/hub.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=./dist/hub.js",
     "prepare": "npm run build",
     "start": "node ./dist/hub.js",
-    "test": "node --experimental-strip-types --test ./test/smoke.test.mjs",
-    "check": "node --experimental-strip-types --check ./hub/hub.ts && node --experimental-strip-types --check ./hub/net.ts && node --experimental-strip-types --check ./extensions/pi-fwd.ts"
+    "test": "node --experimental-strip-types --test ./test/*.test.mjs",
+    "check": "node --experimental-strip-types --check ./hub/hub.ts && node --experimental-strip-types --check ./hub/net.ts && node --experimental-strip-types --check ./extensions/pi-fwd.ts && node --experimental-strip-types --check ./extensions/thinking.ts && node --experimental-strip-types --check ./extensions/tool-presentation.ts && node --experimental-strip-types --check ./extensions/file-tool-renderer.ts"
   },
   "engines": {
     "node": ">=22.6"
